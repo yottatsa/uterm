@@ -1,13 +1,15 @@
 #!/usr/bin/python3
 
 import argparse
+import collections
 import io
 import logging
 import os
 import pty
+import selectors
 import socket
 import stat
-from typing import Union
+from typing import Deque, Union
 
 import serial
 
@@ -18,8 +20,10 @@ TConn = Union[socket.socket, serial.Serial]
 
 
 class HostController(object):
+    GET_CAPS = b"\x00\x00"
     GET_KEYS = b"\x01\x01"
-    SEND_SCREEN = b"\x02\x02"
+    SEND_PTY = b"\x02\x02"
+    SEND_SCREEN = b"\x0f\x0f"  # deprecated
 
     # rfc1055 SLIP special character codes
     END = b"\xc0"  # 0o300 indicates end of packet
@@ -28,14 +32,42 @@ class HostController(object):
     ESC_ESC = b"\xde"  # 0o335 ESC ESC_ESC means ESC data byte
 
     _conn: TConn
-    _io: io.BytesIO
+    _scr: io.BytesIO
+    _kbd: Deque[bytes]
+    _pty: Deque[bytes]
     _fd: int = -1
 
     def __init__(self, conn: TConn) -> None:
         self._conn = conn
-        self._io = io.BytesIO()
+        self._scr = io.BytesIO()
+        self._kbd = collections.deque()
+        self._pty = collections.deque()
+        self._sel = selectors.DefaultSelector()
+
+    def _handle_pty(self, conn: int, mask: int) -> None:
+        if mask & selectors.EVENT_READ:
+            buf = bytearray(2048)
+            l = os.readv(self._fd, [buf])
+            if l > 0:
+                self._pty.extend(buf[:l])  # type: ignore
+
+        if mask & selectors.EVENT_WRITE:
+            if not self._kbd:
+                return
+            buf = bytes(self._kbd)  # type: ignore
+            l = os.writev(self._fd, [buf])
+            if l == len(self._kbd):
+                self._kbd.clear()
+            else:
+                raise RuntimeError
 
     def attach(self, fd: int) -> None:
+        if self._fd != -1:
+            raise RuntimeError
+        os.set_blocking(fd, False)
+        self._sel.register(
+            fd, selectors.EVENT_READ | selectors.EVENT_WRITE, self._handle_pty
+        )
         self._fd = fd
 
     def send(self, data: bytes) -> None:
@@ -102,24 +134,37 @@ class HostController(object):
             return recv[2:]
         return b""
 
-    def send_screen(self) -> None:
-        self.send_packet(self.SEND_SCREEN + self._io.getvalue())
+    def send_pty(self, data: bytes) -> None:
+        self.send_packet(self.SEND_PTY + data)
         self.recv_packet()
 
-    def _process_screen(self):
-        self._io.write(os.read(self._fd, 1))
-        self.send_screen()
+    def send_screen(self, data: bytes) -> None:
+        self.send_packet(self.SEND_SCREEN + data)
+        self.recv_packet()
 
-    def _process_keys(self):
+    def _process_screen(self) -> None:
+        if self._pty:
+            data = bytes(self._pty)  # type: ignore
+            self.send_pty(data)
+            self._pty.clear()
+            logger.info("sent pty: %s", data)
+
+    def _process_keys(self) -> None:
         keystrokes = self.get_keys()
         if keystrokes:
-            os.write(self._fd, keystrokes)
+            self._kbd.extend(keystrokes)  # type: ignore
+            logger.info("received keystrokes: %s", keystrokes)
 
     def serve(self) -> None:
+        self.send_packet(self.GET_CAPS)
+        logger.info("remote: %s", self.recv_packet()[2:].strip(b"\x00").decode())
         while True:
-            # use poll for fd
-            self._process_screen()
+            for key, mask in self._sel.select():
+                callback = key.data
+                callback(key.fileobj, mask)
+
             self._process_keys()
+            self._process_screen()
 
 
 class SocketHostController(HostController):
@@ -149,7 +194,7 @@ def main(debug: bool = False) -> None:
     )
     parser.add_argument("--debug", action="store_true", default=debug)
     parser.add_argument("--device", "-D")
-    parser.add_argument("--terminal", default="vt100")
+    parser.add_argument("--terminal", default="vt52")
 
     args = parser.parse_args()
     if not args.device:
@@ -178,10 +223,10 @@ def main(debug: bool = False) -> None:
     else:
         ctrl = HostController.from_socket(args.device)
 
-    logger.debug("Connection estabished with %s", ctrl._conn)
+    logger.info("received connection: %s", ctrl._conn)
     ctrl.attach(fd)
     ctrl.serve()
 
 
 if __name__ == "__main__":
-    main(True)
+    main()

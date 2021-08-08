@@ -4,6 +4,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+#define EP_TERMSPEC "unix socket terminal"
 #define SERVER_SOCK_FILE "comm"
 
 /* SLIP special character codes
@@ -155,6 +156,7 @@ int recv_packet(unsigned char *p, int len) {
 int main() {
   struct sockaddr_un addr;
   unsigned char buff[8192];
+  unsigned char *p;
   int l, i;
 
   if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
@@ -175,11 +177,30 @@ int main() {
     l = recv_packet(buff, sizeof(buff));
     if (l == 0)
       continue;
+    if (buff[0] == 0x00 && buff[1] == 0x00) {
+      p = buff;
+      *(p++);
+      *(p++);
+      strncpy((char *)p, EP_TERMSPEC, sizeof(EP_TERMSPEC));
+      send_packet(buff, 2 + sizeof(EP_TERMSPEC));
+    }
     if (buff[0] == 0x01 && buff[1] == 0x01) {
-      buff[2] = getch();
-      send_packet(buff, 3);
+      if (kbhit()) {
+        buff[2] = getch();
+        send_packet(buff, 3);
+      } else {
+        send_packet(buff, 2);
+      }
     }
     if (buff[0] == 0x02 && buff[1] == 0x02) {
+      p = buff;
+      *(p++);
+      *(p++);
+      printf("%s", (char *)p);
+      send_packet(buff, 2);
+    }
+    // deprecated
+    if (buff[0] == 0x0f && buff[1] == 0x0f) {
       gotoxy(0, 0);
       for (i = 2; i < l; i++)
         printf("%c", buff[i]);
