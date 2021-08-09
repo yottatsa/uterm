@@ -1,12 +1,3 @@
-#include "compat/conio.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-
-#define EP_TERMSPEC "unix socket terminal"
-#define SERVER_SOCK_FILE "comm"
-
 /* SLIP special character codes
  */
 #define END 0300     /* indicates end of packet */
@@ -14,25 +5,9 @@
 #define ESC_END 0334 /* ESC ESC_END means END data byte */
 #define ESC_ESC 0335 /* ESC ESC_ESC means ESC data byte */
 
-int fd;
-
-void send_char(unsigned char c) {
-  if (send(fd, &c, 1, 0) == -1) {
-    perror("send");
-    close(fd);
-    exit(1);
-  }
-}
-
-unsigned char recv_char() {
-  unsigned char c = 0;
-  if (recv(fd, &c, 1, 0) < 0) {
-    perror("recv");
-    close(fd);
-    exit(1);
-  }
-  return c;
-}
+// interface
+extern void send_char(unsigned char c);
+extern unsigned char recv_char();
 
 /* SEND_PACKET: sends a packet of length "len", starting at
  * location "p".
@@ -151,63 +126,4 @@ int recv_packet(unsigned char *p, int len) {
         p[received++] = c;
     }
   }
-}
-
-int main() {
-  struct sockaddr_un addr;
-  unsigned char buff[8192];
-  unsigned char *p;
-  int l, i;
-
-  if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
-    perror("socket");
-    return 1;
-  }
-
-  memset(&addr, 0, sizeof(addr));
-  addr.sun_family = AF_UNIX;
-  strcpy(addr.sun_path, SERVER_SOCK_FILE);
-  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-    perror("connect");
-    return 1;
-  }
-
-  while (1) {
-    memset(buff, 0, sizeof(buff));
-    l = recv_packet(buff, sizeof(buff));
-    if (l == 0)
-      continue;
-    if (buff[0] == 0x00 && buff[1] == 0x00) {
-      p = buff;
-      *(p++);
-      *(p++);
-      strncpy((char *)p, EP_TERMSPEC, sizeof(EP_TERMSPEC));
-      send_packet(buff, 2 + sizeof(EP_TERMSPEC));
-    }
-    if (buff[0] == 0x01 && buff[1] == 0x01) {
-      if (kbhit()) {
-        buff[2] = getch();
-        send_packet(buff, 3);
-      } else {
-        send_packet(buff, 2);
-      }
-    }
-    if (buff[0] == 0x02 && buff[1] == 0x02) {
-      p = buff;
-      *(p++);
-      *(p++);
-      printf("%s", (char *)p);
-      send_packet(buff, 2);
-    }
-    // deprecated
-    if (buff[0] == 0x0f && buff[1] == 0x0f) {
-      gotoxy(0, 0);
-      for (i = 2; i < l; i++)
-        printf("%c", buff[i]);
-      send_packet(buff, 2);
-    }
-  }
-
-  close(fd);
-  return 0;
 }

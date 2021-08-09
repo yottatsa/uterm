@@ -1,14 +1,11 @@
-CC      = g++
-CFLAGS  = -Icompat -Wno-narrowing
+.PHONY: all format
 
-.PHONY: all format host
-
-all: ep
+all:
+	make -C ansi all
+	make -C cpm all
+	make -C utermhost all
 
 format:
-	clang-format -i ep.c
-	python3 -m isort .
-	black host.py
-
-host: host.py
-	pyre
+	make -C ansi format
+	make -C cpm format
+	make -C utermhost format
