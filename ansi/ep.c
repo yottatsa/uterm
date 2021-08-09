@@ -2,6 +2,7 @@
 #include "compat/conio.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
@@ -25,6 +26,12 @@ unsigned char recv_char() {
     exit(1);
   }
   return c;
+}
+
+unsigned char has_recv_char() {
+  int count;
+  ioctl(fd, FIONREAD, &count);
+  return count;
 }
 
 #undef getch
