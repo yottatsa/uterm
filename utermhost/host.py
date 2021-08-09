@@ -25,13 +25,15 @@ class HostController(object):
     GET_CAPS = b"\x00\x00"
     GET_KEYS = b"\x01\x01"
     SEND_PTY = b"\x02\x02"
-    SIG_INT  = b"\x03\x03"
+    SIG_INT = b"\x03\x03"
 
     # rfc1055 SLIP special character codes
     END = b"\xc0"  # 0o300 indicates end of packet
     ESC = b"\xdb"  # 0o333 indicates byte stuffing
     ESC_END = b"\xdd"  # 0o334 ESC ESC_END means END data byte
     ESC_ESC = b"\xde"  # 0o335 ESC ESC_ESC means ESC data byte
+
+    BUFSIZE = 92
 
     _conn: TConn
     _scr: io.BytesIO
@@ -48,21 +50,24 @@ class HostController(object):
         self._sel = selectors.DefaultSelector()
 
     def _handle_pty(self, conn: int, mask: int) -> None:
-        if mask & selectors.EVENT_READ:
-            buf = bytearray(2048)
-            l = os.readv(self._fd, [buf])
-            if l > 0:
-                self._pty.extend(buf[:l])  # type: ignore
+        try:
+            if mask & selectors.EVENT_READ:
+                buf = bytearray(2048)
+                l = os.readv(self._fd, [buf])
+                if l > 0:
+                    self._pty.extend(buf[:l])  # type: ignore
 
-        if mask & selectors.EVENT_WRITE:
-            if not self._kbd:
-                return
-            buf = bytes(self._kbd)  # type: ignore
-            l = os.writev(self._fd, [buf])
-            if l == len(self._kbd):
-                self._kbd.clear()
-            else:
-                raise RuntimeError
+            if mask & selectors.EVENT_WRITE:
+                if not self._kbd:
+                    return
+                buf = bytes(self._kbd)  # type: ignore
+                l = os.writev(self._fd, [buf])
+                if l == len(self._kbd):
+                    self._kbd.clear()
+                else:
+                    raise RuntimeError
+        except OSError:
+            self.signal_int()
 
     def attach(self, fd: int) -> None:
         if self._fd != -1:
@@ -146,13 +151,15 @@ class HostController(object):
         raise SystemExit
 
     def _process_screen(self) -> None:
-        if self._pty:
+        while self._pty:
             data = bytes(self._pty)  # type: ignore
-            self.send_pty(data)
+            self.send_pty(data[: self.BUFSIZE])
             self._pty.clear()
+            self._pty.extend(data[self.BUFSIZE :])  # type: ignore
             logger.info("sent pty: %s", data)
 
     def _process_keys(self) -> None:
+        time.sleep(1)  # to fix
         keystrokes = self.get_keys()
         if keystrokes:
             self._kbd.extend(keystrokes)  # type: ignore
@@ -172,7 +179,6 @@ class HostController(object):
 
             self._process_keys()
             self._process_screen()
-            time.sleep(0.1)
 
         self.signal_int()
 
@@ -210,6 +216,7 @@ def main(debug: bool = False) -> None:
     )
     parser.add_argument("--debug", action="store_true", default=debug)
     parser.add_argument("--device", "-D")
+    parser.add_argument("--reset", "-R", action="store_true")
     parser.add_argument("--terminal", default="vt52")
 
     args = parser.parse_args()
@@ -222,10 +229,11 @@ def main(debug: bool = False) -> None:
     else:
         logging.basicConfig(level=logging.INFO)
 
-    (pid, fd) = pty.fork()
-    if pid == 0:
-        # child process
-        return setup_shell(args.terminal)
+    if not args.reset:
+        (pid, fd) = pty.fork()
+        if pid == 0:
+            # child process
+            return setup_shell(args.terminal)
 
     if os.path.exists(args.device):
         mode = os.stat(args.device).st_mode
@@ -239,11 +247,15 @@ def main(debug: bool = False) -> None:
     else:
         ctrl = HostController.from_socket(args.device)
 
+    if args.reset:
+        ctrl.signal_int()
+
     logger.info("received connection: %s", ctrl._conn)
     ctrl.attach(fd)
 
     def sigint_handler(*args) -> None:
         ctrl.disable()
+
     signal.signal(signal.SIGINT, sigint_handler)
     ctrl.serve()
 
