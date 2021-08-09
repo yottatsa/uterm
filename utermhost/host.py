@@ -7,8 +7,10 @@ import logging
 import os
 import pty
 import selectors
+import signal
 import socket
 import stat
+import time
 from typing import Deque, Union
 
 import serial
@@ -23,7 +25,7 @@ class HostController(object):
     GET_CAPS = b"\x00\x00"
     GET_KEYS = b"\x01\x01"
     SEND_PTY = b"\x02\x02"
-    SEND_SCREEN = b"\x0f\x0f"  # deprecated
+    SIG_INT  = b"\x03\x03"
 
     # rfc1055 SLIP special character codes
     END = b"\xc0"  # 0o300 indicates end of packet
@@ -36,6 +38,7 @@ class HostController(object):
     _kbd: Deque[bytes]
     _pty: Deque[bytes]
     _fd: int = -1
+    _enabled = True
 
     def __init__(self, conn: TConn) -> None:
         self._conn = conn
@@ -138,9 +141,9 @@ class HostController(object):
         self.send_packet(self.SEND_PTY + data)
         self.recv_packet()
 
-    def send_screen(self, data: bytes) -> None:
-        self.send_packet(self.SEND_SCREEN + data)
-        self.recv_packet()
+    def signal_int(self) -> None:
+        self.send_packet(self.SIG_INT)
+        raise SystemExit
 
     def _process_screen(self) -> None:
         if self._pty:
@@ -155,16 +158,23 @@ class HostController(object):
             self._kbd.extend(keystrokes)  # type: ignore
             logger.info("received keystrokes: %s", keystrokes)
 
+    def disable(self) -> None:
+        self._enabled = False
+
     def serve(self) -> None:
         self.send_packet(self.GET_CAPS)
         logger.info("remote: %s", self.recv_packet()[2:].strip(b"\x00").decode())
-        while True:
+
+        while self._enabled:
             for key, mask in self._sel.select():
                 callback = key.data
                 callback(key.fileobj, mask)
 
             self._process_keys()
             self._process_screen()
+            time.sleep(0.1)
+
+        self.signal_int()
 
 
 class SocketHostController(HostController):
@@ -179,6 +189,12 @@ class SocketHostController(HostController):
 
 class SerialHostController(HostController):
     _conn: serial.Serial
+
+    def send(self, data: bytes) -> None:
+        self._conn.write(data)
+
+    def recv(self, buffersize: int) -> bytes:
+        return self._conn.read(buffersize)
 
 
 def setup_shell(terminal: str) -> None:
@@ -225,6 +241,10 @@ def main(debug: bool = False) -> None:
 
     logger.info("received connection: %s", ctrl._conn)
     ctrl.attach(fd)
+
+    def sigint_handler(*args) -> None:
+        ctrl.disable()
+    signal.signal(signal.SIGINT, sigint_handler)
     ctrl.serve()
 
 
