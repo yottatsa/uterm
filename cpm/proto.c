@@ -5,9 +5,6 @@
 
 #define EP_TERMSPEC "unix socket terminal"
 
-extern int getch();
-extern int kbhit();
-
 // interface
 extern unsigned char has_recv_char();
 
@@ -15,13 +12,19 @@ int mainloop() {
   unsigned char buff[128];
   unsigned char kbd[64];
   unsigned char *p, *kbd_p;
-  int l, i;
+  int l, i, c;
 
   kbd_p = kbd;
 
+  putchar(0x1B);
+  putchar("j"[0]);
+
   while (1) {
-    if (kbhit())
-      *(kbd_p++) = getch();
+    if (c = getk()) {
+      *(kbd_p++) = c;
+      putchar(c);
+      continue;
+    }
     if (has_recv_char() == 0)
       continue;
 
@@ -42,8 +45,12 @@ int mainloop() {
       kbd_p = kbd;
     }
     if (buff[0] == 0x02 && buff[1] == 0x02) {
+      putchar(0x1B);
+      putchar("k"[0]);
       for (i = 2; i < l; i++)
         putchar(buff[i]);
+      putchar(0x1B);
+      putchar("j"[0]);
       send_packet(buff, 2);
     }
     if (buff[0] == 0x03 && buff[1] == 0x03) {

@@ -2,6 +2,7 @@
 
 import argparse
 import collections
+import fcntl
 import io
 import logging
 import os
@@ -10,7 +11,10 @@ import selectors
 import signal
 import socket
 import stat
+import struct
+import termios
 import time
+from enum import Enum
 from typing import Deque, Union
 
 import serial
@@ -19,6 +23,17 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 TConn = Union[socket.socket, serial.Serial]
+
+
+def set_winsize(fd, row, col, xpix=0, ypix=0):
+    winsize = struct.pack("HHHH", row, col, xpix, ypix)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+
+
+class Direction(Enum):
+    UND = 0
+    IN = 1
+    OUT = 2
 
 
 class HostController(object):
@@ -34,13 +49,16 @@ class HostController(object):
     ESC_ESC = b"\xde"  # 0o335 ESC ESC_ESC means ESC data byte
 
     BUFSIZE = 92
+    IO_TIMEOUT = 5
 
     _conn: TConn
     _scr: io.BytesIO
     _kbd: Deque[bytes]
     _pty: Deque[bytes]
     _fd: int = -1
-    _enabled = True
+    _enabled = False
+
+    graceful: bool = False
 
     def __init__(self, conn: TConn) -> None:
         self._conn = conn
@@ -62,16 +80,19 @@ class HostController(object):
                     return
                 buf = bytes(self._kbd)  # type: ignore
                 l = os.writev(self._fd, [buf])
+                # termios.tcdrain(self._fd)
                 if l == len(self._kbd):
                     self._kbd.clear()
                 else:
                     raise RuntimeError
         except OSError:
             self.signal_int()
+            raise SystemExit
 
     def attach(self, fd: int) -> None:
         if self._fd != -1:
             raise RuntimeError
+        set_winsize(fd, 24, 51)
         os.set_blocking(fd, False)
         self._sel.register(
             fd, selectors.EVENT_READ | selectors.EVENT_WRITE, self._handle_pty
@@ -88,7 +109,8 @@ class HostController(object):
         """
         rfc1055 SLIP send_packet
         """
-        logger.debug(">>> %s", data)
+        logger.debug(">>>---")
+        self.set_watchdog()
         self.send(
             self.END
             + data.replace(self.ESC, self.ESC + self.ESC_ESC).replace(
@@ -96,13 +118,16 @@ class HostController(object):
             )
             + self.END
         )
+        logger.debug(">>> %s", data)
 
     def recv_packet(self) -> bytes:
         """
         rfc1055 SLIP recv_packet
         """
         received = io.BytesIO()
+        logger.debug("<<<---")
         while True:
+            self.set_watchdog()
             char = self.recv(1)
             if len(char) == 0:
                 raise SystemExit
@@ -147,38 +172,39 @@ class HostController(object):
         self.recv_packet()
 
     def signal_int(self) -> None:
+        logger.info("resetting remote side")
         self.send_packet(self.SIG_INT)
-        raise SystemExit
-
-    def _process_screen(self) -> None:
-        while self._pty:
-            data = bytes(self._pty)  # type: ignore
-            self.send_pty(data[: self.BUFSIZE])
-            self._pty.clear()
-            self._pty.extend(data[self.BUFSIZE :])  # type: ignore
-            logger.info("sent pty: %s", data)
-
-    def _process_keys(self) -> None:
-        time.sleep(1)  # to fix
-        keystrokes = self.get_keys()
-        if keystrokes:
-            self._kbd.extend(keystrokes)  # type: ignore
-            logger.info("received keystrokes: %s", keystrokes)
 
     def disable(self) -> None:
         self._enabled = False
+        signal.alarm(0)
+
+    def set_watchdog(self) -> None:
+        if self._enabled:
+            signal.alarm(self.IO_TIMEOUT)
 
     def serve(self) -> None:
         self.send_packet(self.GET_CAPS)
         logger.info("remote: %s", self.recv_packet()[2:].strip(b"\x00").decode())
 
+        self._enabled = True
         while self._enabled:
             for key, mask in self._sel.select():
                 callback = key.data
                 callback(key.fileobj, mask)
 
-            self._process_keys()
-            self._process_screen()
+            keystrokes = self.get_keys()
+            if keystrokes:
+                self._kbd.extend(keystrokes)  # type: ignore
+                logger.info("received keystrokes: %s", keystrokes)
+                continue
+
+            while self._pty:
+                data = bytes(self._pty)  # type: ignore
+                self.send_pty(data[: self.BUFSIZE])
+                self._pty.clear()
+                self._pty.extend(data[self.BUFSIZE :])  # type: ignore
+                logger.info("sent pty: %s", data)
 
         self.signal_int()
 
@@ -195,11 +221,24 @@ class SocketHostController(HostController):
 
 class SerialHostController(HostController):
     _conn: serial.Serial
+    _last_direction: Direction
+
+    SWAP_DELAY = 0.1
+
+    def __init__(self, conn: TConn) -> None:
+        super(SerialHostController, self).__init__(conn)
+        self._last_direction = Direction.UND
 
     def send(self, data: bytes) -> None:
+        if self.SWAP_DELAY and self._last_direction != Direction.OUT:
+            time.sleep(self.SWAP_DELAY)
+            self._last_direction = Direction.OUT
         self._conn.write(data)
 
     def recv(self, buffersize: int) -> bytes:
+        if self.SWAP_DELAY and self._last_direction != Direction.IN:
+            time.sleep(self.SWAP_DELAY)
+            self._last_direction = Direction.IN
         return self._conn.read(buffersize)
 
 
@@ -249,14 +288,35 @@ def main(debug: bool = False) -> None:
 
     if args.reset:
         ctrl.signal_int()
+        raise SystemExit
 
     logger.info("received connection: %s", ctrl._conn)
     ctrl.attach(fd)
 
     def sigint_handler(*args) -> None:
-        ctrl.disable()
+        if ctrl.graceful:
+            ctrl.graceful = False
+            logger.info("received SIGINT")
+            ctrl.disable()
+        else:
+            logger.error("SIGINT")
+            raise SystemExit
 
+    def sigalrm_handler(*args) -> None:
+        if ctrl.graceful:
+            ctrl.graceful = False
+            logger.warning("timeout, trying to recover")
+            # logger.warning("timeout, graceful shutdown")
+            # ctrl.signal_int()
+            ctrl.send_packet(ctrl.GET_CAPS)
+            ctrl.graceful = True
+        else:
+            logger.error("timeout")
+            raise SystemError
+
+    ctrl.graceful = True
     signal.signal(signal.SIGINT, sigint_handler)
+    signal.signal(signal.SIGALRM, sigalrm_handler)
     ctrl.serve()
 
 
